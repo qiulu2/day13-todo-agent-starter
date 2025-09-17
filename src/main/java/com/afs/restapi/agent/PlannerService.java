@@ -229,19 +229,62 @@ public class PlannerService {
      * AI may return plans in multiple formats:
      * 1. Pure JSON format
      * 2. JSON in Markdown code blocks
+     * 3. JSON with extra text
      * <p>
      * This method is responsible for parsing these formats and extracting structured execution plans
      */
     private PlanTaskResult parseAIResponse(String response) {
         logger.info("Parsing AI response to extract execution plan");
+        logger.debug("Raw AI response: {}", response);
 
-        // Try to parse as direct JSON
-        if (response.trim().startsWith("{")) {
-            return parseAsDirectJson(response);
+        String trimmedResponse = response.trim();
+
+        // Method 1: Try to parse as direct JSON
+        if (trimmedResponse.startsWith("{") && trimmedResponse.endsWith("}")) {
+            return parseAsDirectJson(trimmedResponse);
         }
 
-        // Try to extract JSON from Markdown code blocks
-        return parseFromMarkdownCodeBlocks(response);
+        // Method 2: Try to extract JSON from Markdown code blocks
+        PlanTaskResult markdownResult = parseFromMarkdownCodeBlocks(response);
+        if (markdownResult != null && !markdownResult.getPlans().isEmpty()) {
+            return markdownResult;
+        }
+
+        // Method 3: Try to find JSON within the text using regex
+        return extractJsonFromText(response);
+    }
+
+    /**
+     * Extract JSON from text using pattern matching
+     */
+    private PlanTaskResult extractJsonFromText(String response) {
+        logger.info("Attempting to extract JSON from mixed text response");
+
+        // Look for JSON pattern in the text
+        java.util.regex.Pattern jsonPattern = java.util.regex.Pattern.compile(
+            "\\{[^{}]*(?:\\{[^{}]*\\}[^{}]*)*\\}",
+            java.util.regex.Pattern.DOTALL
+        );
+
+        java.util.regex.Matcher matcher = jsonPattern.matcher(response);
+
+        while (matcher.find()) {
+            String jsonCandidate = matcher.group();
+            try {
+                JsonNode jsonNode = objectMapper.readTree(jsonCandidate);
+                // Check if it has the required fields
+                if (jsonNode.has("function") || jsonNode.has("functionName")) {
+                    PlanInfo planInfo = objectMapper.treeToValue(jsonNode, PlanInfo.class);
+                    logger.info("Successfully extracted JSON from text: {}", planInfo.getFunctionName());
+                    return new PlanTaskResult(Collections.singletonList(planInfo));
+                }
+            } catch (Exception e) {
+                logger.debug("Failed to parse JSON candidate: {}", jsonCandidate);
+            }
+        }
+
+        logger.error("Unable to extract valid JSON from response: {}", response);
+        throw new RuntimeException("Unable to parse AI's response as valid JSON");
     }
 
     /**
@@ -318,43 +361,64 @@ public class PlannerService {
      * Phase 3: Plan Execution
      * <p>
      * Execute tool calls according to AI's plan.
-     * This is like following a recipe step by step.
      *
      * @param executionPlan Execution plan
-     * @return Execution results
+     * @return Execution results in JSON format
      */
     private String executeExecutionPlan(PlanTaskResult executionPlan) {
         logger.info("Phase 3: Executing execution plan");
 
         if (executionPlan.getPlans().isEmpty()) {
             logger.warn("No execution plan to execute");
-            return null;
+            return "{}";
         }
 
-        // Prepare tool mapping table for fast lookup
+        // Prepare tool mapping for efficient lookup
         Map<String, ToolCallback> toolMap = prepareToolMap();
 
+        // Execute each plan step and collect results
+        List<Map<String, Object>> executionResults = new ArrayList<>();
+
         // Execute each plan step sequentially
-        StringBuilder results = new StringBuilder();
         for (int i = 0; i < executionPlan.getPlans().size(); i++) {
             PlanInfo plan = executionPlan.getPlans().get(i);
-            logger.info("Executing step {}/{}: {}", i + 1, executionPlan.getPlans().size(), plan.getFunctionName());
+            logger.info("Executing step {}: {} - {}", i + 1, plan.getFunctionName(), plan.getDescription());
 
+            // Execute the single plan step
             String stepResult = executeSinglePlanStep(plan, toolMap);
-            if (stepResult != null) {
-                if (!results.isEmpty()) {
-                    results.append("\n");
-                }
 
-                results.append("Plan ").append(i + 1)
-                        .append(plan)
-                        .append("\nResult : ").append(stepResult);
+            // Create result object for this step
+            Map<String, Object> stepResultObj = new HashMap<>();
+            stepResultObj.put("step", i + 1);
+            stepResultObj.put("function", plan.getFunctionName());
+            stepResultObj.put("description", plan.getDescription());
+            stepResultObj.put("parameters", plan.getVariables());
+
+            // Parse step result as JSON if possible, otherwise keep as string
+            try {
+                JsonNode resultNode = objectMapper.readTree(stepResult);
+                stepResultObj.put("result", resultNode);
+            } catch (Exception e) {
+                stepResultObj.put("result", stepResult);
             }
+
+            executionResults.add(stepResultObj);
         }
 
-        String finalResult = "Results:\n" + results;
-        logger.info("Execution plan completed, result length: {}", finalResult != null ? finalResult.length() : 0);
-        return finalResult;
+        // Create final result object
+        Map<String, Object> finalResult = new HashMap<>();
+        finalResult.put("success", true);
+        finalResult.put("totalSteps", executionPlan.getPlans().size());
+        finalResult.put("executionResults", executionResults);
+
+        try {
+            String jsonResult = objectMapper.writeValueAsString(finalResult);
+            logger.info("Execution plan completed, returning JSON result");
+            return jsonResult;
+        } catch (JsonProcessingException e) {
+            logger.error("Failed to serialize execution results to JSON", e);
+            return "{\"success\": false, \"error\": \"Failed to serialize results\"}";
+        }
     }
 
     /**
